@@ -1,19 +1,23 @@
 package snowflake
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	sf "github.com/bwmarrin/snowflake"
 	"github.com/go-redis/redis/v8"
-	"hash/fnv"
 	"time"
 )
 
 var (
-	RedisClient redis.UniversalClient
-
+	// FailCallbackFunc node id 失效后的回调函数，一般用于更新健康检查重启 pod
 	FailCallbackFunc = func() {}
+	// RedisClient 默认使用 redis 进行分布式 node id 配置及心跳机制
+	// 使用默认 NodeIdGeneratorFunc 和 HeartBeatFunc 时必须设置
+	RedisClient redis.UniversalClient
+	// NodeIdGeneratorFunc 允许自定义的分布式ID生成器
+	NodeIdGeneratorFunc DistributeIdGenerator = defaultGenerateDistributedNodeId
+	// HeartBeatFunc 允许自定义的保持占有 node id 的心跳函数
+	HeartBeatFunc HeartBeatExecutor = defaultHeartBeat
 
 	NodeKeyTemplate = "snowflake:node:id:%d"
 
@@ -39,7 +43,8 @@ type Node struct {
 func NewNode(identifier string) (node *Node, nodeId uint8, err error) {
 	// 自定义 snowflake 格式
 	customSnowflake()
-	if nodeId, err = generateDistributedNodeId(identifier); err != nil {
+
+	if nodeId, err = NodeIdGeneratorFunc(identifier); err != nil {
 		return
 	}
 	lastOccupiedTimeMillis = time.Now().UnixMilli()
@@ -55,28 +60,7 @@ func NewNode(identifier string) (node *Node, nodeId uint8, err error) {
 		NodeId:     nodeId,
 		Identifier: identifier,
 	}
-	go func(node *Node) {
-		nodeId := node.NodeId
-		if node.Identifier == "" {
-			fmt.Println("Snowflake ID generated in debug mode. Heart beat auto-disabled")
-			return
-		}
-		fmt.Println("Snowflake heartbeat starts")
-		for {
-			time.Sleep(HeartbeatInterval)
-			if res, err := RedisClient.Exists(context.Background(), getPreemptRedisKey(nodeId)).Result(); err != nil {
-				fmt.Printf("Snowflake node id occupied failed. %+v\n", err)
-				continue
-			} else if res != 1 {
-				panic("should not happen")
-			}
-			if _, err := RedisClient.SetEX(context.Background(), getPreemptRedisKey(nodeId), identifier, OccupiedInterval).Result(); err != nil {
-				fmt.Printf("Snowflake node_id = %d occupied failed. %+v\n", nodeId, err)
-				continue
-			}
-			lastOccupiedTimeMillis = time.Now().UnixMilli()
-		}
-	}(node)
+	go HeartBeatFunc(node)
 	return
 }
 
@@ -89,52 +73,8 @@ func (n *Node) Generate() (sf.ID, error) {
 	return n.node.Generate(), nil
 }
 
-func generateDistributedNodeId(identifier string) (nodeId uint8, err error) {
-	// 生成 NODE ID
-	if identifier == "" {
-		fmt.Println("Snowflake node identifier not set. Node id always 1")
-		nodeId = 1
-	} else {
-		nodeId = hash(identifier)
-		//fmt.Printf("Snowflake node identifier set. node identifier = %s, node id = %d\n", identifier, nodeId)
-		// 抢占 Node ID
-		if err = preemptNodeID(identifier, nodeId); err != nil {
-			return
-		}
-	}
-	return
-}
-
-func preemptNodeID(identifier string, nodeId uint8) (err error) {
-	ctx, cancel := context.WithTimeout(context.Background(), HeartbeatInterval)
-	defer cancel()
-	if success, err := RedisClient.SetNX(ctx, getPreemptRedisKey(nodeId), identifier, OccupiedInterval).Result(); err != nil {
-		return fmt.Errorf("cannot occupy snowflake node. nodeId=%d, podId=%s, err=%+v", nodeId, identifier, err)
-	} else if !success {
-		return fmt.Errorf("cannot occupy snowflake node. nodeId=%d, podId=%s. node id in used", nodeId, identifier)
-	}
-	if success, err := RedisClient.Expire(ctx, getPreemptRedisKey(nodeId), OccupiedInterval).Result(); err != nil {
-		return fmt.Errorf("cannot occupy snowflake node. nodeId=%d, podId=%s, err=%+v", nodeId, identifier, err)
-	} else if !success {
-		return fmt.Errorf("cannot occupy snowflake node. nodeId=%d, podId=%s. should not happen", nodeId, identifier)
-	}
-	return
-}
-
-func getPreemptRedisKey(nodeId uint8) string {
-	return fmt.Sprintf(NodeKeyTemplate, nodeId)
-}
-
 func customSnowflake() {
 	sf.Epoch = Epoch
 	sf.NodeBits = NodeBits
 	sf.StepBits = StepBits
-}
-
-func hash(s string) uint8 {
-	h := fnv.New32a()
-	if _, err := h.Write([]byte(s)); err != nil {
-		panic("Hash to get snowflake node id failed")
-	}
-	return uint8(h.Sum32())
 }
